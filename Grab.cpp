@@ -22,6 +22,7 @@
 #include <string>
 #include <iostream>
 #include <thread>
+#include <mutex>          // std::mutex
 #include <pylon/PylonIncludes.h>
 #include <opencv2/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -32,10 +33,11 @@
 // Include file to use pylon universal instant camera parameters.
 #include <pylon/BaslerUniversalInstantCamera.h>
 #include <pylon/BaslerUniversalInstantCameraArray.h>
+#include <queue>
 #ifdef PYLON_WIN_BUILD
 #    include <pylon/PylonGUI.h>
 #endif
-
+#include <mutex>          // std::mutex, std::lock
 // Namespace for using pylon objects.
 using namespace Pylon;
 
@@ -51,95 +53,164 @@ void AutoGainContinuous( CBaslerUniversalInstantCamera& camera );
 void AutoExposureOnce( CBaslerUniversalInstantCamera& camera );
 void AutoExposureContinuous( CBaslerUniversalInstantCamera& camera );
 void AutoWhiteBalance( CBaslerUniversalInstantCamera& camera );
-
-        
-int main( int /*argc*/, char* /*argv*/[] )
+std::mutex mtx; 
+// Number of images to be grabbed.
+static const uint32_t c_countOfImagesToGrab = 30;
+//Enumeration used for distinguishing different events.
+enum MyEvents
 {
-        // Create an instant camera object with the camera device found first.
-        //CInstantCamera camera( CTlFactory::GetInstance().CreateFirstDevice() );
-        //camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-        //CBaslerUniversalInstantCamera
-        
-        //Pylon::CBaslerUniversalInstantCamera cameras( min( devices.size(), c_maxCamerasToUse ) );
-        //CBaslerUniversalInstantCameraArray cameras( min( devices.(), c_maxCamerasToUse));
-        int exitCode = 0;
-        PylonInitialize();
-        try
+    eMyExposureEndEvent = 100,
+    eMyEventOverrunEvent = 200
+    // More events can be added here.
+};
+queue<std::pair<cv::Mat,std::string>> integer_queue;
+int frame_num = 0;
+//Example of an image event handler.
+// Example handler for camera events.
+class CSampleCameraEventHandler : public CBaslerUniversalCameraEventHandler
+{
+public:
+    // Only very short processing tasks should be performed by this method. Otherwise, the event notification will block the
+    // processing of images.
+    virtual void OnCameraEvent( CBaslerUniversalInstantCamera& camera, intptr_t userProvidedId, GenApi::INode* /* pNode */ )
+    {
+        std::cout << std::endl;
+        switch (userProvidedId)
         {
-            CImageFormatConverter converter;
-            CPylonImage targetImage;
-            CGrabResultPtr ptrGrabResult;
-            cv::Mat cameraImg;
-            DeviceInfoList_t devices;
-            CTlFactory& tlFactory = CTlFactory::GetInstance();
-            // The exit code of the sample application.
-            
-            // Before using any pylon methods, the pylon runtime must be initialized.
-            if (tlFactory.EnumerateDevices( devices ) == 0)
-            {
-                throw RUNTIME_EXCEPTION( "No camera present." );
-            }
-             CBaslerUniversalInstantCameraArray cameras( min( devices.size(), c_maxCamerasToUse ) );
-            for (size_t i = 0; i < cameras.GetSize(); ++i)
-            {
-                 cameras[i].Attach( tlFactory.CreateDevice( devices[i] ) );
-            
-                // Print the model name of the camera.
-                cout << "Using device " << cameras[i].GetDeviceInfo().GetModelName() << endl;
-            }
-        converter.OutputPixelFormat = Pylon::PixelType_BGR8packed;
-        // Get all attached devices and exit application if no device is found.
-            
-       
-        for(size_t i = 0 ;i < cameras.GetSize(); ++i){
-                cameras[i].Open();
-                int minLowerLimit = cameras[i].AutoGainLowerLimit.GetMin();
-                int maxUpperLimit = cameras[i].AutoGainUpperLimit.GetMax();
-                cameras[i].AutoGainLowerLimit.SetValue(minLowerLimit);
-                cameras[i].AutoGainUpperLimit.SetValue(maxUpperLimit);
-                cameras[i].AutoFunctionROIUseBrightness.SetValue(true);
-                cameras[i].ExposureTime.SetValue(99900);
-                cameras[i].GainAuto.SetValue("Continuous");
-                // Print the model name of the camera.
-                cout << "Using device " << cameras[i].GetDeviceInfo().GetModelName() << endl;
+            case eMyExposureEndEvent: // Exposure End event
+                if (camera.EventExposureEndFrameID.IsReadable()) // Applies to cameras based on SFNC 2.0 or later, e.g, USB cameras
+                {
+                    cout << "Exposure End event. FrameID: " << camera.EventExposureEndFrameID.GetValue() << " Timestamp: " << camera.EventExposureEndTimestamp.GetValue() << std::endl << std::endl;
+
+                }
+                else
+                {
+                    cout << "Exposure End event. FrameID: " << camera.ExposureEndEventFrameID.GetValue() << " Timestamp: " << camera.ExposureEndEventTimestamp.GetValue() << std::endl << std::endl;
+                }
+                break;
+            case eMyEventOverrunEvent:  // Event Overrun event
+                cout << "Event Overrun event. FrameID: " << camera.EventOverrunEventFrameID.GetValue() << " Timestamp: " << camera.EventOverrunEventTimestamp.GetValue() << std::endl << std::endl;
+                break;
         }
-            
-        // This smart pointer will receive the grab result data.
-        cameras.StartGrabbing(GrabStrategy_LatestImageOnly);
-        // Camera.StopGrabbing() is called automatically by the RetrieveResult() method
-        // when c_countOfImagesToGrab images have been retrieved.
-        while(cameras.IsGrabbing())
-        {
-            // Wait for an image and then retrieve it. A timeout of 5000 ms is used.
-            cameras.RetrieveResult( 5000, ptrGrabResult, TimeoutHandling_ThrowException );
-            // Image grabbed successfully?
-            if (ptrGrabResult->GrabSucceeded())
+    }
+};
+class CSampleImageEventHandler : public CImageEventHandler
+{
+public:
+    virtual void OnImageGrabbed( CInstantCamera& camera, const CGrabResultPtr& ptrGrabResult)
+    {
+        cv::Mat cameraImg;
+        CImageFormatConverter converter;
+                    converter.OutputPixelFormat.SetValue(Pylon::PixelType_BGR8packed);
+        CPylonImage targetImage;
+        cout << "CSampleImageEventHandler::OnImageGrabbed called." << std::endl;
+        cout << std::endl;
+  
+        
+    //   mtx.lock();
+        if (ptrGrabResult->GrabSucceeded())
             {
-                 // Create a target image
+
+         // Create a target image
                 converter.Convert( targetImage, ptrGrabResult);
-                intptr_t cameraContextValue = ptrGrabResult->GetCameraContext();
+               // intptr_t cameraContextValue = ptrGrabResult->GetCameraContext();
                 cameraImg= cv::Mat(ptrGrabResult->GetHeight(),ptrGrabResult->GetWidth(),CV_8UC3,(uint8_t*) targetImage.GetBuffer(),cv::Mat::AUTO_STEP);//,cv::Mat::AUTO_STEP
-                cout <<"Camera "+ std::to_string(cameraContextValue)+ ": "<< cameras[cameraContextValue].GetDeviceInfo().GetModelName() <<endl;
+             //   cout <<"Camera "+ std::to_string(cameraContextValue)+ ": "<< cameras[cameraContextValue].GetDeviceInfo().GetModelName() <<endl;
                 // Access the image data
                 
-                //cout << "SizeX: " << ptrGrabResult->GetWidth() << endl;
-                //cout << "SizeY: " << ptrGrabResult->GetHeight() << endl;
-                //const uint8_t* pImageBuffer = (uint8_t*) ptrGrabResult->GetBuffer();
-                //cout << "Gray value of first pixel: " << (uint32_t) pImageBuffer[0] << endl << endl;
-                string windowName = "Live Video: Camera " + std::to_string(cameraContextValue);
-                cv::namedWindow(windowName, (int)(cameraContextValue));
-                cv::imshow(windowName, cameraImg);
-                //ptrGrabResult.Release();
-                cv::waitKey(1);
-#ifdef PYLON_WIN_BUILD
-                // Display the grabbed image.
-                Pylon::DisplayImage( 1, ptrGrabResult );
-#endif
-            }
-            else
+                cout << "SizeX: " << ptrGrabResult->GetWidth() << endl;
+                cout << "SizeY: " << ptrGrabResult->GetHeight() << endl;
+                const uint8_t* pImageBuffer = (uint8_t*) ptrGrabResult->GetBuffer();
+                cout << "Gray value of first pixel: " << (uint32_t) pImageBuffer[0] << endl << endl;
+                //string windowName = "Live Video: Camera " + std::to_string(cameraContextValue);
+           
+              string name = string(camera.GetDeviceInfo().GetDeviceIdx());
+              
+               string windowName = "Live Video: Camera " + name;
+                   integer_queue.push(std::make_pair(cameraImg,windowName));
+              //  cv::namedWindow(windowName, std::stoi(name));
+              
+               // cv::imshow(windowName, cameraImg);
+               // cv::waitKey(2);
+        }
+        else
             {
                 cout << "Error: " << std::hex << ptrGrabResult->GetErrorCode() << std::dec << " " << ptrGrabResult->GetErrorDescription() << endl;
-            }
+            }   
+            
+     
+    }
+   
+
+};
+
+//class Basler_CameraView
+//{
+   // public:
+   // void operator()(DeviceInfoList_t& device, size_t index)
+   void Basler_CameraView(DeviceInfoList_t& device, size_t index)
+    {
+        PylonInitialize();
+        CTlFactory& tlFactory = CTlFactory::GetInstance();
+        CBaslerUniversalInstantCamera camera( tlFactory.CreateDevice( device[index] ));
+        CGrabResultPtr ptrGrabResult;
+        CSampleCameraEventHandler* pHandler1 = new CSampleCameraEventHandler;
+        try
+        {
+                cout << "Using device " << camera.GetDeviceInfo().GetModelName() << endl;
+
+                camera.RegisterImageEventHandler( new CSampleImageEventHandler, RegistrationMode_ReplaceAll, Cleanup_Delete );
+   
+                camera.GrabCameraEvents = true;
+
+                 if (!camera.EventSelector.IsWritable())
+                {
+                    throw RUNTIME_EXCEPTION( "The device doesn't support events." );
+                }   
+                
+
+        camera.Open();
+        int minLowerLimit = camera.AutoGainLowerLimit.GetMin();
+                int maxUpperLimit = camera.AutoGainUpperLimit.GetMax();
+                camera.AutoGainLowerLimit.SetValue(minLowerLimit);
+                camera.AutoGainUpperLimit.SetValue(maxUpperLimit);
+                camera.AutoFunctionROIUseBrightness.SetValue(true);
+                camera.ExposureTime.SetValue(8333);
+                camera.GainAuto.SetValue("Continuous");
+                camera.AcquisitionFrameRateEnable = true;
+                camera.AcquisitionFrameRate = 30;
+                camera.UserSetSelector.SetValue(UserSetSelector_Default);
+                  camera.UserSetLoad.Execute();
+                camera.LineSelector.SetValue(LineSelector_Line4);
+                camera.LineMode.SetValue(LineMode_Input);
+               camera.TriggerSelector.SetValue(TriggerSelector_FrameStart);
+               camera.TriggerSource.SetValue(TriggerSource_Line4);
+                camera.TriggerMode.SetValue(TriggerMode_On);
+        CImageFormatConverter converter;
+                    converter.OutputPixelFormat.SetValue(Pylon::PixelType_BGR8packed);
+
+        // Camera event processing must be activated first, the default is off.
+        camera.RegisterCameraEventHandler( pHandler1, "EventExposureEndData", eMyExposureEndEvent, RegistrationMode_ReplaceAll, Cleanup_Delete );        
+          
+        // For demonstration purposes only, register another image event handler.
+         camera.EventSelector.SetValue( EventSelector_ExposureEnd );
+        // Enable it.
+        if (!camera.EventNotification.TrySetValue( EventNotification_On ))
+        {
+            // scout-f, scout-g, and aviator GigE cameras use a different value
+            camera.EventNotification.SetValue( EventNotification_GenICamEvent );
+        }
+     
+        // Print the model name of the camera
+        // This smart pointer will receive the grab result data.
+        camera.StartGrabbing(GrabStrategy_OneByOne,GrabLoop_ProvidedByUser);
+
+        while(camera.IsGrabbing())
+        {
+                int64_t  status = camera.LineStatus.GetValue();
+                cout << "Line status: " << status << endl;
+                camera.RetrieveResult( 5000, ptrGrabResult, TimeoutHandling_ThrowException );
+                ptrGrabResult.Release();
         }
 
         }
@@ -148,10 +219,97 @@ int main( int /*argc*/, char* /*argv*/[] )
             // Error handling.
             cerr << "An exception occurred." << endl
             << e.GetDescription() << endl;
-            exitCode = 1;
+         //   exitCode = 1;
         }
-
+        
     // Comment the following two lines to disable waiting on exit.
+    delete pHandler1;
+    //cerr << endl << "Press enter to exit." << endl;
+    //while (cin.get() != '\n');
+    PylonTerminate();
+    }
+     
+//};
+void show_image(void)
+{
+    while(1){
+               if(integer_queue.size() > 1)
+            {
+
+                cv::namedWindow(integer_queue.back().second, cv::WINDOW_NORMAL);
+		cv::resizeWindow(integer_queue.back().second,300,700);
+                cv::imshow(integer_queue.back().second, integer_queue.back().first);
+                cv::waitKey(1);
+                integer_queue.pop();
+
+            }
+    }
+}
+int main( int /*argc*/, char* /*argv*/[] )
+{
+        // Create an instant camera object with the camera device found first.
+        DeviceInfoList_t devices;
+        CBaslerUniversalInstantCameraArray cameras( min( devices.size(), c_maxCamerasToUse));
+        std::vector<std::thread> thread_vec;
+        int exitCode = 0;
+        
+        PylonInitialize();
+
+            CTlFactory& tlFactory = CTlFactory::GetInstance();
+            // The exit code of the sample application.
+      
+            // Before using any pylon methods, the pylon runtime must be initialized.
+           if (tlFactory.EnumerateDevices( devices ) == 0)
+            {
+                throw RUNTIME_EXCEPTION( "No camera present." );
+            }
+
+            for (size_t i = 0; i < devices.size(); ++i)
+            {
+        
+                thread_vec.push_back(std::thread(Basler_CameraView, std::ref(devices), i));
+                // Print the model name of the camera.
+            }
+            thread_vec.push_back(std::thread(show_image));
+        for(std::thread &thread : thread_vec)
+        {
+            thread.join();
+        }
+        
+        // Get all attached devices and exit application if no device is found.
+            
+        /*for(size_t i = 0 ;i < cameras.GetSize(); ++i){
+                
+                int minLowerLimit = cameras[i].AutoGainLowerLimit.GetMin();
+                int maxUpperLimit = cameras[i].AutoGainUpperLimit.GetMax();
+                cameras[i].AutoGainLowerLimit.SetValue(minLowerLimit);
+                cameras[i].AutoGainUpperLimit.SetValue(maxUpperLimit);
+                cameras[i].AutoFunctionROIUseBrightness.SetValue(true);
+                cameras[i].ExposureTime.SetValue(8333);
+                cameras[i].GainAuto.SetValue("Continuous");
+                cameras[i].AcquisitionFrameRateEnable = true;
+                cameras[i].AcquisitionFrameRate = 30;
+                cameras[i].UserSetSelector = "Default";
+                cameras[i].UserSetLoad.Execute();
+                cameras[i].LineSelector = "Line4";
+                cameras[i].LineMode = "Input";
+                cameras[i].TriggerSelector = "FrameStart";
+                cameras[i].TriggerSource = "Line4";
+                cameras[i].TriggerMode = "On";
+                 // For demonstration purposes only, register another image event handler.
+                cameras[i].RegisterImageEventHandler( new CSampleImageEventHandler, RegistrationMode_Append, Cleanup_Delete );
+                cameras[i].GrabCameraEvents = true;
+                cameras[i].Open();
+                 if (!cameras[i].EventSelector.IsWritable())
+                {
+                    throw RUNTIME_EXCEPTION( "The device doesn't support events." );
+                }   
+                // Print the model name of the camera.
+                cout << "Using device " << cameras[i].GetDeviceInfo().GetModelName() <<endl;
+        }
+        */
+       //;
+    
     cerr << endl << "Press enter to exit." << endl;
     while (cin.get() != '\n');
 
